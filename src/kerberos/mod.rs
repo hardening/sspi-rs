@@ -4,6 +4,7 @@ mod encryption_params;
 pub mod flags;
 mod messages;
 mod pa_datas;
+pub mod pac;
 pub mod server;
 #[cfg(test)]
 mod tests;
@@ -174,6 +175,11 @@ impl Kerberos {
         OffsetDateTime::now_utc()
             .checked_add(self.clock_offset)
             .ok_or_else(|| Error::new(ErrorKind::TimeSkew, "KDC clock offset is out of range"))
+    }
+
+    /// The server side properties, after a ticket was accepted: the client, its PAC.
+    pub fn server_properties(&self) -> Option<&ServerProperties> {
+        self.server.as_deref()
     }
 
     pub fn config(&self) -> &KerberosConfig {
@@ -951,6 +957,7 @@ pub mod test_data {
             additional_service_keys: Vec::new(),
             user: None,
             client: None,
+            client_pac: None,
             authenticators_cache: Default::default(),
         }
     }

@@ -71,6 +71,9 @@ pub struct ServerProperties {
     ///
     /// This field should be set by the Kerberos implementation after successful log on.
     pub client: Option<Username>,
+    /// The PAC of the ticket of the authenticated client, when there is one (an Active Directory
+    /// KDC puts one in): the SIDs of the user and its groups. Set with `client`.
+    pub client_pac: Option<super::pac::Pac>,
     /// Authenticators cache.
     ///
     /// [Receipt of KRB_AP_REQ Message](https://www.rfc-editor.org/rfc/rfc4120#section-3.2.3):
@@ -106,6 +109,7 @@ impl ServerProperties {
             additional_service_keys: Vec::new(),
             user,
             client: None,
+            client_pac: None,
             authenticators_cache: AuthenticatorsCache::new(),
         })
     }
@@ -287,6 +291,19 @@ pub async fn accept_security_context(
                 )?;
 
                 let ticket_enc_part = decrypt_ap_req_ticket(ticket_decryption_key, &ap_req)?;
+                let client_pac = ticket_enc_part
+                    .0
+                    .authorization_data
+                    .0
+                    .as_ref()
+                    .and_then(|ad| super::pac::find(&ad.0))
+                    .and_then(|data| match super::pac::decode(&data) {
+                        Ok(pac) => Some(pac),
+                        Err(error) => {
+                            warn!(%error, "Undecodable PAC in the ticket, ignored");
+                            None
+                        }
+                    });
                 let session_key = Secret::new(ticket_enc_part.0.key.0.key_value.0.0.clone());
 
                 let AuthenticatorInner {
@@ -414,6 +431,7 @@ pub async fn accept_security_context(
                 debug!("ApReq Ticket and Authenticator are valid!");
 
                 server_data.client = Some(client_upn(&cname.0, &crealm.0)?);
+                server_data.client_pac = client_pac;
 
                 let ap_options_bytes = ap_req.0.ap_options.0.0.as_bytes();
                 // [5.5.1.  KRB_AP_REQ Definition](https://www.rfc-editor.org/rfc/rfc4120#section-5.5.1)

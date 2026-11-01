@@ -595,6 +595,30 @@ pub struct CredSspServer<C: CredentialsProxy<AuthenticationData = AuthIdentity>>
     context_config: Option<ServerMode>,
 }
 
+impl<C: CredentialsProxy<AuthenticationData = AuthIdentity>> CredSspServer<C> {
+    /// The security package that authenticates the client (`NTLM`, `Kerberos`...), once the
+    /// exchange started; for SPNEGO, the package it negotiated.
+    pub fn negotiated_package(&self) -> Option<&str> {
+        match &self.context.as_ref()?.sspi_context {
+            SspiContext::Negotiate(negotiate) => Some(negotiate.negotiated_protocol().protocol_name()),
+            other => Some(other.package_name()),
+        }
+    }
+
+    /// The PAC of the client's ticket ([`crate::kerberos::pac`]), once Kerberos authenticated it.
+    pub fn client_pac(&self) -> Option<&kerberos::pac::Pac> {
+        let kerberos = match &self.context.as_ref()?.sspi_context {
+            SspiContext::Negotiate(negotiate) => match negotiate.negotiated_protocol() {
+                negotiate::NegotiatedProtocol::Kerberos(kerberos) => kerberos,
+                _ => return None,
+            },
+            SspiContext::Kerberos(kerberos) => kerberos,
+            _ => return None,
+        };
+        kerberos.server_properties()?.client_pac.as_ref()
+    }
+}
+
 impl<C: CredentialsProxy<AuthenticationData = AuthIdentity> + Send> CredSspServer<C> {
     pub fn new(public_key: Vec<u8>, credentials: C, client_mode: ServerMode) -> crate::Result<Self> {
         Ok(Self {
