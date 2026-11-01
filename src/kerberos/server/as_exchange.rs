@@ -10,10 +10,13 @@ use crate::generator::YieldPointLocal;
 use crate::kerberos::TGT_SERVICE_NAME;
 use crate::kerberos::client::extractors::{extract_encryption_params_from_as_rep_with_salt, extract_preauth_salt};
 use crate::kerberos::client::generators::{
-    GenerateAsPaDataOptions, GenerateAsReqOptions, generate_as_req, generate_as_req_kdc_body, generate_nonce,
+    GenerateAsPaDataOptions, GenerateAsReqOptions, GenerateKeytabPaDataOptions, generate_as_req,
+    generate_as_req_kdc_body, generate_nonce,
 };
 use crate::kerberos::client::kdc::as_exchange::clock_offset_from_error;
-use crate::kerberos::client::principal::{get_client_principal_name_type, get_client_principal_realm};
+use crate::kerberos::client::principal::{
+    ClientPrincipalName, get_client_principal_name, get_client_principal_name_type, get_client_principal_realm,
+};
 use crate::kerberos::pa_datas::{AsRepSessionKeyExtractor, AsReqPaDataOptions};
 use crate::kerberos::utils::serialize_message;
 use crate::{ClientRequestFlags, CredentialsBuffers, Error, ErrorKind, Kerberos, Result};
@@ -47,6 +50,8 @@ pub(crate) async fn request_tgt(
         ));
     }
 
+    // A keytab gives the long-term key of the service principal directly: the usual setup of a
+    // host (computer) account, whose password nobody knows.
     let (username, password, realm, cname_type) = match credentials {
         CredentialsBuffers::AuthIdentity(auth_identity) => {
             let username = auth_identity.user.to_string();
@@ -56,7 +61,7 @@ pub(crate) async fn request_tgt(
             let realm = get_client_principal_realm(&username, &domain);
             let cname_type = get_client_principal_name_type(&username, &domain);
 
-            (username, password, realm, cname_type)
+            (username, Some(password), realm, cname_type)
         }
         #[cfg(feature = "scard")]
         CredentialsBuffers::SmartCard(_) => {
@@ -65,11 +70,15 @@ pub(crate) async fn request_tgt(
                 "smart card credentials are not supported in Kerberos application server",
             ));
         }
-        CredentialsBuffers::Keytab(_) => {
-            return Err(Error::new(
-                ErrorKind::UnsupportedPreAuth,
-                "keytab credentials are not supported in Kerberos application server",
-            ));
+        CredentialsBuffers::Keytab(keytab) => {
+            let ClientPrincipalName {
+                name,
+                realm_domain,
+                name_type,
+            } = get_client_principal_name(&keytab.principal);
+            let realm = get_client_principal_realm(name, realm_domain);
+
+            (name.to_owned(), None, realm, name_type)
         }
     };
     server.realm = Some(realm.clone());
@@ -87,29 +96,27 @@ pub(crate) async fn request_tgt(
     };
     let kdc_req_body = generate_as_req_kdc_body(&options)?;
 
-    let pa_data_options = match credentials {
-        CredentialsBuffers::AuthIdentity(auth_identity) => {
+    let pa_data_options = match (credentials, &password) {
+        (CredentialsBuffers::AuthIdentity(auth_identity), Some(password)) => {
             let domain = auth_identity.domain.to_string();
             let salt = format!("{domain}{username}").into_bytes();
 
             AsReqPaDataOptions::AuthIdentity(GenerateAsPaDataOptions {
-                password: &password,
+                password,
                 salt,
                 enc_params: server.encryption_params.clone(),
                 with_pre_auth: false,
             })
         }
-        #[cfg(feature = "scard")]
-        CredentialsBuffers::SmartCard(_) => {
+        (CredentialsBuffers::Keytab(keytab), _) => AsReqPaDataOptions::Keytab(GenerateKeytabPaDataOptions {
+            key: keytab.key.clone(),
+            key_enctype: keytab.key_enctype.clone(),
+            with_pre_auth: false,
+        }),
+        _ => {
             return Err(Error::new(
                 ErrorKind::UnsupportedPreAuth,
-                "smart card credentials are not supported in Kerberos application server",
-            ));
-        }
-        CredentialsBuffers::Keytab(_) => {
-            return Err(Error::new(
-                ErrorKind::UnsupportedPreAuth,
-                "keytab credentials are not supported in Kerberos application server",
+                "unsupported credentials in Kerberos application server",
             ));
         }
     };
@@ -125,10 +132,16 @@ pub(crate) async fn request_tgt(
     let encryption_type = CipherSuite::try_from(usize::from(encryption_type))?;
     server.encryption_params.encryption_type = Some(encryption_type);
 
-    let mut session_key_extractor = AsRepSessionKeyExtractor::AuthIdentity {
-        salt: &salt,
-        password: &password,
-        enc_params: &mut server.encryption_params,
+    let mut session_key_extractor = match (credentials, &password) {
+        (CredentialsBuffers::Keytab(keytab), _) => AsRepSessionKeyExtractor::Keytab {
+            key: keytab.key.as_ref(),
+            enc_params: &server.encryption_params,
+        },
+        (_, password) => AsRepSessionKeyExtractor::AuthIdentity {
+            salt: &salt,
+            password: password.as_deref().unwrap_or_default(),
+            enc_params: &mut server.encryption_params,
+        },
     };
 
     let server_props = server.server.as_mut().ok_or_else(|| {
