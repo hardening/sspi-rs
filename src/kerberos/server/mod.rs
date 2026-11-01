@@ -233,20 +233,23 @@ pub async fn accept_security_context(
                 flags: ServerResponseFlags::empty(),
                 expiry: None,
             });
-        } else if let Ok(_ap_req) = if builder.context_requirements.contains(ServerRequestFlags::USE_DCE_STYLE) {
-            picky_asn1_der::from_bytes::<ApReq>(&input_token.buffer).map_err(Error::from)
         } else {
-            decode_krb_message::<ApReq>(&input_token.buffer, AP_REQ_TOKEN_ID)
-        } {
-            // The client may send ApReq instead of TgtReq in the first message.
-            // It means that the client wants to perform regular Kerberos without U2U.
-            // In that case, we just move Kerberos state to the next one and process further.
-            state = KerberosServerState::Preauthentication;
-        } else {
-            return Err(Error::new(
-                ErrorKind::InvalidToken,
-                "invalid Kerberos token: expected TgtReq or ApReq",
-            ));
+            match if builder.context_requirements.contains(ServerRequestFlags::USE_DCE_STYLE) {
+                picky_asn1_der::from_bytes::<ApReq>(&input_token.buffer).map_err(Error::from)
+            } else {
+                decode_krb_message::<ApReq>(&input_token.buffer, AP_REQ_TOKEN_ID)
+            } {
+                // The client may send ApReq instead of TgtReq in the first message.
+                // It means that the client wants to perform regular Kerberos without U2U.
+                // In that case, we just move Kerberos state to the next one and process further.
+                Ok(_ap_req) => state = KerberosServerState::Preauthentication,
+                Err(error) => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidToken,
+                        format!("invalid Kerberos token: expected TgtReq or ApReq ({error})"),
+                    ));
+                }
+            }
         }
     }
 

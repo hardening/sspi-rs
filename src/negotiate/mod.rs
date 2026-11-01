@@ -412,6 +412,13 @@ impl Negotiate {
             ));
         };
 
+        // Kerberos authenticated the client with its ticket, and checks the `mechListMIC` with the
+        // session key: there is no credential of the user to look for (a Kerberos user usually has
+        // none on the server).
+        if self.protocol.is_kerberos() {
+            return Ok(());
+        }
+
         let ContextNames { username } = self.protocol.query_context_names()?;
 
         let candidates: Vec<Credentials> = auth_data

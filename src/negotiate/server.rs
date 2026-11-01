@@ -13,6 +13,25 @@ use crate::{
     SecurityBuffer, SecurityStatus, ServerRequestFlags, ServerResponseFlags, SspiImpl,
 };
 
+/// The inner token of a `NegTokenResp`, without the OCTET STRING header picky-asn1-der leaves on
+/// it when the optional fields before `responseToken` (`negState`, `supportedMech`) are absent,
+/// as FreeRDP sends them.
+///
+/// No mechanism token starts with an OCTET STRING (GSS-API tokens start with `0x60`, a raw AP-REQ
+/// with `0x6e`, NTLM with `NTLMSSP`): a token that is exactly one OCTET STRING is unwrapped.
+fn strip_spurious_octet_string(token: Vec<u8>) -> Vec<u8> {
+    let inner_start = match token.as_slice() {
+        [0x04, len, ..] if *len < 0x80 => Some((2, usize::from(*len))),
+        [0x04, 0x81, len, ..] => Some((3, usize::from(*len))),
+        [0x04, 0x82, hi, lo, ..] => Some((4, usize::from(*hi) << 8 | usize::from(*lo))),
+        _ => None,
+    };
+    match inner_start {
+        Some((header, len)) if header + len == token.len() => token[header..].to_vec(),
+        _ => token,
+    }
+}
+
 /// Performs one authentication step.
 ///
 /// The user should call this function until it returns `SecurityStatus::Ok`.
@@ -142,7 +161,7 @@ pub(crate) async fn accept_security_context(
             } = neg_token_targ.0;
 
             let input_token = SecurityBuffer::find_buffer_mut(input, BufferType::Token)?;
-            let token = response_token.0.map(|token| token.0.0);
+            let token = response_token.0.map(|token| strip_spurious_octet_string(token.0.0));
             if let Some(token) = token {
                 input_token.buffer = token;
             } else {
@@ -280,4 +299,29 @@ fn prepare_neg_token(
     output_token.buffer = encoded_final_neg_token_targ;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use picky_krb::gss_api::NegTokenTarg1;
+
+    use super::strip_spurious_octet_string;
+
+    #[test]
+    fn response_token_without_neg_state() {
+        // NegTokenResp { responseToken [2] OCTET STRING { 60 03 01 02 03 } }, as FreeRDP sends it
+        let resp = [
+            0xa1, 0x0b, 0x30, 0x09, 0xa2, 0x07, 0x04, 0x05, 0x60, 0x03, 0x01, 0x02, 0x03,
+        ];
+        let targ: NegTokenTarg1 = picky_asn1_der::from_bytes(&resp).unwrap();
+        let token = targ.0.response_token.0.unwrap().0.0;
+        assert_eq!(strip_spurious_octet_string(token), [0x60, 0x03, 0x01, 0x02, 0x03]);
+
+        // tokens left as they are
+        assert_eq!(strip_spurious_octet_string(vec![0x60, 0x01, 0x00]), [0x60, 0x01, 0x00]);
+        assert_eq!(strip_spurious_octet_string(vec![0x04, 0x05, 0x01]), [0x04, 0x05, 0x01]);
+        let mut long = vec![0x04, 0x82, 0x01, 0x00];
+        long.extend([0x60; 0x100]);
+        assert_eq!(strip_spurious_octet_string(long).len(), 0x100);
+    }
 }

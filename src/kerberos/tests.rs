@@ -347,13 +347,27 @@ fn initiator_accepts_mic_token_with_invalid_seq_number() {
 }
 
 #[test]
-fn acceptor_rejects_mic_token_with_invalid_seq_number() {
+fn acceptor_accepts_mic_token_with_seq_number_0() {
     let mut server = test_data::fake_server();
     server.remote_seq_number = 10;
 
     let data = b"SPNEGO mechTypes";
     let sub_session_key = server.encryption_params.sub_session_key.clone().unwrap();
     let mic_token = utils::generate_mic_token(true, 0, data.to_vec(), &sub_session_key, &AesSize::Aes256).unwrap();
+
+    server
+        .verify_mic_token(&mic_token, data, crate::private::Sealed)
+        .expect("MIC verification should succeed with seq number 0, as FreeRDP sends it");
+}
+
+#[test]
+fn acceptor_rejects_mic_token_with_invalid_seq_number() {
+    let mut server = test_data::fake_server();
+    server.remote_seq_number = 10;
+
+    let data = b"SPNEGO mechTypes";
+    let sub_session_key = server.encryption_params.sub_session_key.clone().unwrap();
+    let mic_token = utils::generate_mic_token(true, 7, data.to_vec(), &sub_session_key, &AesSize::Aes256).unwrap();
 
     assert_eq!(
         server

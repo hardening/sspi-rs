@@ -34,7 +34,9 @@ pub(crate) fn validate_mic_token(
     let token = MicToken::decode(raw_token)?;
     let token_flags = token.flags;
 
-    if enforce_seq_number && token.seq_num != expected_seq_number {
+    // The SPNEGO mechListMIC of an initiator may use the sequence number 0, whatever the one of
+    // its authenticator: FreeRDP's client does, as the Windows acceptor does for its own.
+    if enforce_seq_number && token.seq_num != expected_seq_number && token.seq_num != 0 {
         return Err(Error::new(
             ErrorKind::InvalidToken,
             format!(
