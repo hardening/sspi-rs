@@ -1,6 +1,9 @@
+mod delegated;
 #[cfg(feature = "tsssp")]
 pub mod sspi_cred_ssp;
 mod ts_request;
+
+pub use delegated::{DelegatedCredentials, RemoteGuardPackage, read_delegated_credentials};
 
 use std::io;
 
@@ -593,6 +596,7 @@ pub struct CredSspServer<C: CredentialsProxy<AuthenticationData = AuthIdentity>>
     credentials_handle: Option<CredentialsBuffers>,
     ts_request_version: u32,
     context_config: Option<ServerMode>,
+    delegated: Option<DelegatedCredentials>,
 }
 
 impl<C: CredentialsProxy<AuthenticationData = AuthIdentity>> CredSspServer<C> {
@@ -603,6 +607,12 @@ impl<C: CredentialsProxy<AuthenticationData = AuthIdentity>> CredSspServer<C> {
             SspiContext::Negotiate(negotiate) => Some(negotiate.negotiated_protocol().protocol_name()),
             other => Some(other.package_name()),
         }
+    }
+
+    /// What the client delegated at the end of the exchange: a password, nothing (Restricted
+    /// Admin), a smart card or Remote Guard credentials.
+    pub fn delegated_credentials(&self) -> Option<&DelegatedCredentials> {
+        self.delegated.as_ref()
     }
 
     /// The PAC of the client's ticket ([`crate::kerberos::pac`]), once Kerberos authenticated it.
@@ -629,6 +639,7 @@ impl<C: CredentialsProxy<AuthenticationData = AuthIdentity> + Send> CredSspServe
             credentials_handle: None,
             ts_request_version: TS_REQUEST_VERSION,
             context_config: Some(client_mode),
+            delegated: None,
         })
     }
 
@@ -646,6 +657,7 @@ impl<C: CredentialsProxy<AuthenticationData = AuthIdentity> + Send> CredSspServe
             credentials_handle: None,
             ts_request_version,
             context_config: Some(client_mode),
+            delegated: None,
         })
     }
 
@@ -748,18 +760,34 @@ impl<C: CredentialsProxy<AuthenticationData = AuthIdentity> + Send> CredSspServe
                     ts_request
                 );
 
-                let read_credentials = try_cred_ssp_server!(
-                    self.context.as_mut().unwrap().decrypt_ts_credentials(&auth_info),
-                    ts_request
-                );
+                let context = self.context.as_mut().unwrap();
+                let credentials = try_cred_ssp_server!(context.decrypt_message(&auth_info), ts_request);
+                let delegated = try_cred_ssp_server!(read_delegated_credentials(&credentials), ts_request);
 
                 self.state = CredSspState::Final;
 
-                let auth_identity = try_cred_ssp_server!(
-                    AuthIdentity::try_from(read_credentials.into_auth_identity().unwrap())
-                        .map_err(|e| Error::new(ErrorKind::InvalidParameter, e)),
-                    ts_request
-                );
+                // the delegated password, or the authenticated user without one (Restricted Admin,
+                // smart card, Remote Guard: see `delegated_credentials`)
+                let auth_identity = match &delegated {
+                    DelegatedCredentials::Password { user, domain, password } => try_cred_ssp_server!(
+                        Username::new(user, Some(domain.as_str()).filter(|d| !d.is_empty()))
+                            .map(|username| AuthIdentity {
+                                username,
+                                password: password.as_ref().clone().into(),
+                            })
+                            .map_err(|e| Error::new(ErrorKind::InvalidParameter, e)),
+                        ts_request
+                    ),
+                    _ => {
+                        let ContextNames { username } =
+                            try_cred_ssp_server!(context.sspi_context.query_context_names(), ts_request);
+                        AuthIdentity {
+                            username,
+                            password: String::new().into(),
+                        }
+                    }
+                };
+                self.delegated = Some(delegated);
 
                 Ok(ServerState::Finished(auth_identity))
             }
@@ -1549,12 +1577,6 @@ impl CredSspContext {
 
             self.encrypt_ts_credentials(credentials, mode)
         }
-    }
-
-    fn decrypt_ts_credentials(&mut self, auth_info: &[u8]) -> crate::Result<CredentialsBuffers> {
-        let ts_credentials_buffer = self.decrypt_message(auth_info)?;
-
-        read_ts_credentials(ts_credentials_buffer.as_slice())
     }
 
     fn encrypt_message(&mut self, input: &[u8]) -> crate::Result<Vec<u8>> {
