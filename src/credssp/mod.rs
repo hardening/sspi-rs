@@ -774,7 +774,9 @@ impl<C: CredentialsProxy<AuthenticationData = AuthIdentity> + Send> CredSspServe
                 let builder = sspi_context
                     .accept_security_context()
                     .with_credentials_handle(&mut credentials_handle)
-                    .with_context_requirements(ServerRequestFlags::empty())
+                    // as the client side does: Kerberos user to user is accepted (the server
+                    // otherwise warns that the client asked for it without this flag)
+                    .with_context_requirements(ServerRequestFlags::USE_SESSION_KEY)
                     .with_target_data_representation(DataRepresentation::Native)
                     .with_input(&mut input_token)
                     .with_output(&mut output_token);
