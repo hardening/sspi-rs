@@ -43,6 +43,25 @@ pub(super) fn negotiate_mech_type(
     mech_list: &MechTypeList,
     negotiate: &mut Negotiate,
 ) -> crate::Result<(ObjectIdentifier, usize)> {
+    let position = |oid: &ObjectIdentifier| mech_list.0.iter().position(|mech_type| mech_type.0 == *oid);
+
+    // Kerberos user to user, when the client prefers it to Kerberos and the server has the
+    // credentials to get its own TGT (a password or a keytab key).
+    let krb5_u2u = oids::krb5_user_to_user();
+    if let Some(u2u_index) = position(&krb5_u2u)
+        && negotiate.package_list.kerberos
+        && let NegotiatedProtocol::Kerberos(kerberos) = &negotiate.protocol
+        && kerberos
+            .server_properties()
+            .is_some_and(|p| p.user.is_some() || p.tgt_provider.is_some())
+        && [oids::ms_krb5(), oids::krb5()]
+            .iter()
+            .filter_map(&position)
+            .all(|krb5_index| u2u_index < krb5_index)
+    {
+        return Ok((krb5_u2u, u2u_index));
+    }
+
     let ms_krb5 = oids::ms_krb5();
     if let Some(mech_index) = mech_list.0.iter().position(|mech_type| mech_type.0 == ms_krb5)
         && negotiate.package_list.kerberos

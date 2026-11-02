@@ -27,7 +27,9 @@ use url::Url;
 pub use self::client::initialize_security_context;
 use self::config::{KdcResolution, KerberosConfig};
 pub use self::encryption_params::EncryptionParams;
-pub use self::server::{ServerProperties, accept_security_context};
+pub use self::server::{
+    ServerProperties, ServiceTgt, ServiceTgtProvider, accept_security_context, request_service_tgt,
+};
 use super::channel_bindings::ChannelBindings;
 use crate::builders::ChangePassword;
 use crate::generator::{
@@ -958,6 +960,7 @@ pub mod test_data {
             user: None,
             client: None,
             client_pac: None,
+            tgt_provider: None,
             authenticators_cache: Default::default(),
         }
     }
