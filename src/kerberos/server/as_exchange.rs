@@ -29,20 +29,51 @@ use crate::kerberos::utils::serialize_message;
 use crate::{ClientRequestFlags, CredentialsBuffers, Error, ErrorKind, Kerberos, KerberosConfig, Result, Secret};
 
 /// A TGT of the service principal, for Kerberos user to user: the client asks the KDC for a
-/// ticket encrypted with its session key.
+/// ticket encrypted with its session key. [`request_service_tgt`] gets one for any principal (a
+/// user's, from their password): what the fields give is enough to write a credential cache.
 #[derive(Clone)]
 pub struct ServiceTgt {
     pub ticket: Ticket,
     pub session_key: Secret<Vec<u8>>,
+    /// the encryption type of `session_key`
+    pub key_type: i32,
     /// when the TGT expires
     pub end_time: SystemTime,
     pub realm: String,
+    /// the client principal: its name type and components (in `realm`)
+    pub client_name_type: i32,
+    pub client_name: Vec<String>,
+    /// the ticket flags, flag 0 (reserved) the most significant bit, as credential caches have it
+    pub flags: u32,
+    pub auth_time: SystemTime,
+    pub start_time: Option<SystemTime>,
+    pub renew_till: Option<SystemTime>,
+}
+
+/// A Kerberos time of a reply.
+fn kerberos_time(t: &picky_krb::data_types::KerberosTime, what: &str) -> Result<SystemTime> {
+    OffsetDateTime::try_from(t.0.clone())
+        .map(SystemTime::from)
+        .map_err(|e| Error::new(ErrorKind::InvalidToken, format!("TGT {what}: {e:?}")))
+}
+
+/// A small ASN.1 integer (a name or encryption type).
+fn small_integer(i: &picky_asn1::wrapper::IntegerAsn1, what: &str) -> Result<i32> {
+    let bytes = i.as_signed_bytes_be();
+    if bytes.is_empty() || bytes.len() > 4 {
+        return Err(Error::new(ErrorKind::InvalidToken, format!("TGT {what}: out of range")));
+    }
+    let fill = if bytes[0] & 0x80 != 0 { 0xff } else { 0 };
+    let mut b = [fill; 4];
+    b[4 - bytes.len()..].copy_from_slice(bytes);
+    Ok(i32::from_be_bytes(b))
 }
 
 impl fmt::Debug for ServiceTgt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServiceTgt")
             .field("realm", &self.realm)
+            .field("client_name", &self.client_name)
             .field("end_time", &self.end_time)
             .finish_non_exhaustive()
     }
@@ -216,14 +247,36 @@ async fn as_service_tgt(
         ),
     };
     let part = decrypt_as_rep(&as_rep, key.as_ref(), &server.encryption_params)?;
-    let end_time = OffsetDateTime::try_from(part.end_time.0.0)
-        .map_err(|e| Error::new(ErrorKind::InvalidToken, format!("TGT end time: {e:?}")))?;
+    let flag_bytes = part.flags.0.0.as_bytes();
+    let mut flags = [0u8; 4];
+    // the first byte is the number of unused bits
+    for (i, b) in flag_bytes.iter().skip(1).take(4).enumerate() {
+        flags[i] = *b;
+    }
+    let cname = &as_rep.0.cname.0;
 
     Ok(ServiceTgt {
-        ticket: as_rep.0.ticket.0,
+        ticket: as_rep.0.ticket.0.clone(),
         session_key: part.key.0.key_value.0.to_vec().into(),
-        end_time: SystemTime::from(end_time),
+        key_type: small_integer(&part.key.0.key_type.0, "key type")?,
+        end_time: kerberos_time(&part.end_time.0, "end time")?,
         realm: as_rep.0.crealm.0.to_string(),
+        client_name_type: small_integer(&cname.name_type.0, "client name type")?,
+        client_name: cname.name_string.0.0.iter().map(|n| n.to_string()).collect(),
+        flags: u32::from_be_bytes(flags),
+        auth_time: kerberos_time(&part.auth_time.0, "auth time")?,
+        start_time: part
+            .start_time
+            .0
+            .as_ref()
+            .map(|t| kerberos_time(&t.0, "start time"))
+            .transpose()?,
+        renew_till: part
+            .renew_till
+            .0
+            .as_ref()
+            .map(|t| kerberos_time(&t.0, "renew till"))
+            .transpose()?,
     })
 }
 
