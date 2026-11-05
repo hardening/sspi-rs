@@ -10,7 +10,7 @@ use cryptoki::context::{CInitializeArgs, Pkcs11};
 #[cfg(not(target_arch = "wasm32"))]
 use cryptoki::mechanism::Mechanism;
 #[cfg(not(target_arch = "wasm32"))]
-use cryptoki::object::{Attribute, KeyType, ObjectClass};
+use cryptoki::object::{Attribute, AttributeType, KeyType, ObjectClass};
 #[cfg(not(target_arch = "wasm32"))]
 use cryptoki::session::UserType;
 #[cfg(not(target_arch = "wasm32"))]
@@ -38,6 +38,11 @@ pub(crate) enum SmartCardApi {
         ///
         /// Reader name is needed to determine which PKCS11 slot to use.
         reader_name: String,
+        /// DER-encoded certificate of the credentials.
+        ///
+        /// A card may hold several keys (a PIV card has a slot for each use): the one to sign
+        /// with is the private key of this certificate, the object of the same `CKA_ID`.
+        certificate: Vec<u8>,
     },
     /// Represents Windows native smart card API.
     ///
@@ -107,9 +112,12 @@ impl SmartCard {
                 )
             }
             #[cfg(not(target_arch = "wasm32"))]
-            SmartCardType::SystemProvided { pkcs11_module_path } => {
-                Self::new_system_provided(pkcs11_module_path, user_pin, reader_name.clone())
-            }
+            SmartCardType::SystemProvided { pkcs11_module_path } => Self::new_system_provided(
+                pkcs11_module_path,
+                user_pin,
+                reader_name.clone(),
+                picky_asn1_der::to_vec(certificate)?,
+            ),
             #[cfg(target_os = "windows")]
             SmartCardType::WindowsNative => Self::new_windows_native(
                 user_pin,
@@ -150,7 +158,12 @@ impl SmartCard {
 
     /// Creates a new [SmartCard] instance with the system provided smart card inside.
     #[cfg(not(target_arch = "wasm32"))]
-    fn new_system_provided(pkcs11_module_path: &Path, user_pin: Secret<Vec<u8>>, reader_name: String) -> Result<Self> {
+    fn new_system_provided(
+        pkcs11_module_path: &Path,
+        user_pin: Secret<Vec<u8>>,
+        reader_name: String,
+        certificate: Vec<u8>,
+    ) -> Result<Self> {
         use cryptoki::context::CInitializeFlags;
 
         let pkcs11 = Pkcs11::new(pkcs11_module_path)?;
@@ -160,6 +173,7 @@ impl SmartCard {
             smart_card_type: SmartCardApi::Pkcs11 {
                 pkcs11_module: pkcs11,
                 reader_name,
+                certificate,
             },
             pin: user_pin,
         })
@@ -176,6 +190,7 @@ impl SmartCard {
             SmartCardApi::Pkcs11 {
                 pkcs11_module,
                 reader_name,
+                certificate,
             } => {
                 let slot = 's: {
                     for slot in pkcs11_module.get_slots_with_token()? {
@@ -198,12 +213,41 @@ impl SmartCard {
                 let pin = AuthPin::new(pin.into());
                 session.login(UserType::User, Some(&pin))?;
 
+                let data_to_sign = encode_digest(digest)?;
+
+                // the private key of the certificate: the object of its CKA_ID
+                let certificate_id = session
+                    .find_objects(&[
+                        Attribute::Class(ObjectClass::CERTIFICATE),
+                        Attribute::Value(certificate.clone()),
+                    ])?
+                    .into_iter()
+                    .find_map(|object| {
+                        session
+                            .get_attributes(object, &[AttributeType::Id])
+                            .ok()?
+                            .into_iter()
+                            .find_map(|attribute| match attribute {
+                                Attribute::Id(id) => Some(id),
+                                _ => None,
+                            })
+                    });
+                if let Some(id) = certificate_id {
+                    let keys = session.find_objects(&[
+                        Attribute::Class(ObjectClass::PRIVATE_KEY),
+                        Attribute::KeyType(KeyType::RSA),
+                        Attribute::Id(id),
+                    ])?;
+                    if let Some(private_key) = keys.into_iter().next() {
+                        return Ok(session.sign(&Mechanism::RsaPkcs, private_key, &data_to_sign)?);
+                    }
+                }
+
+                // a card that doesn't list the certificate: the first key that signs
                 let objects = session.find_objects(&[
                     Attribute::Class(ObjectClass::PRIVATE_KEY),
                     Attribute::KeyType(KeyType::RSA),
                 ])?;
-
-                let data_to_sign = encode_digest(digest)?;
 
                 for private_key in objects {
                     if let Ok(signature) = session.sign(&Mechanism::RsaPkcs, private_key, &data_to_sign) {
